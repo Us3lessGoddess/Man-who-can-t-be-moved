@@ -13,9 +13,11 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 VOICE_CHANNEL_ID = int(os.getenv("VOICE_CHANNEL_ID"))
 
 # How often the watchdog checks the connection is still alive (seconds)
-WATCHDOG_INTERVAL = 30
+WATCHDOG_INTERVAL = 60
 # How long to wait between reconnect attempts if one fails (seconds)
-RECONNECT_BACKOFF = 5
+RECONNECT_BACKOFF = 10
+# How long to wait after a disconnect before even trying to reconnect (seconds)
+POST_DISCONNECT_DELAY = 8
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("vc_keepalive")
@@ -58,31 +60,36 @@ async def connect_to_vc():
         guild = channel.guild
         voice_client = guild.voice_client
 
-        for attempt in range(1, 4):  # try up to 3 times per call
-            try:
-                if voice_client is None or not voice_client.is_connected():
-                    if voice_client is not None:
-                        try:
-                            await voice_client.disconnect(force=True)
-                        except Exception:
-                            pass
-                        await asyncio.sleep(1)
-                    voice_client = await channel.connect(reconnect=True, self_deaf=True, timeout=30)
-                    log.info(f"Connected to {channel.name}")
-                    return True
-                elif voice_client.channel.id != VOICE_CHANNEL_ID:
-                    await voice_client.move_to(channel)
-                    log.info(f"Moved to {channel.name}")
-                    return True
-                else:
-                    # already connected to the right channel
-                    return True
-            except Exception as e:
-                log.warning(f"connect_to_vc attempt {attempt} failed: {e}")
-                await asyncio.sleep(RECONNECT_BACKOFF * attempt)
-
-        log.error("All connect_to_vc attempts failed this cycle.")
-        return False
+        try:
+            if voice_client is None:
+                # No forced disconnect/teardown here, nothing to tear down yet.
+                voice_client = await channel.connect(reconnect=True, self_deaf=True, timeout=30)
+                log.info(f"Connected to {channel.name}")
+                return True
+            elif not voice_client.is_connected():
+                # Let discord.py's own reconnect=True machinery try first rather than
+                # us forcing a fresh teardown, that churn is likely what's causing
+                # extra disconnects on an already shaky connection.
+                await asyncio.sleep(POST_DISCONNECT_DELAY)
+                if guild.voice_client is not None and guild.voice_client.is_connected():
+                    return True  # it recovered on its own, nothing more to do
+                try:
+                    await voice_client.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(RECONNECT_BACKOFF)
+                voice_client = await channel.connect(reconnect=True, self_deaf=True, timeout=30)
+                log.info(f"Reconnected to {channel.name}")
+                return True
+            elif voice_client.channel.id != VOICE_CHANNEL_ID:
+                await voice_client.move_to(channel)
+                log.info(f"Moved to {channel.name}")
+                return True
+            else:
+                return True  # already connected to the right channel
+        except Exception as e:
+            log.warning(f"connect_to_vc failed: {e}")
+            return False
 
 
 @bot.event
@@ -104,7 +111,7 @@ async def on_voice_state_update(member, before, after):
     # If the bot itself got disconnected (kicked, channel deleted, server outage, etc), rejoin immediately
     if member.id == bot.user.id and after.channel is None:
         log.warning("Disconnected from voice, rejoining...")
-        await asyncio.sleep(2)
+        await asyncio.sleep(POST_DISCONNECT_DELAY)
         await connect_to_vc()
 
 
