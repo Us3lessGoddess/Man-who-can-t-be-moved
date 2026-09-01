@@ -1,6 +1,7 @@
 import discord
 from discord.ext import commands, tasks
 import asyncio
+import time
 import os
 import logging
 from dotenv import load_dotenv
@@ -130,5 +131,23 @@ async def before_watchdog():
     await bot.wait_until_ready()
 
 
+def run_with_backoff():
+    """If bot.run() dies, don't let the process exit straight into Render's instant
+    auto-restart, that's what turns one temporary Discord rate-limit block into a
+    repeating one. Wait a real, growing amount of time before retrying instead."""
+    backoff = 60  # start at 1 minute
+    max_backoff = 3600  # cap at 1 hour
+    while True:
+        try:
+            bot.run(TOKEN)
+            log.info("bot.run() exited cleanly, stopping.")
+            break
+        except Exception as e:
+            log.warning(f"bot.run() crashed: {e}")
+        log.info(f"Waiting {backoff}s before trying to log in again...")
+        time.sleep(backoff)
+        backoff = min(backoff * 2, max_backoff)
+
+
 keep_alive()
-bot.run(TOKEN)
+run_with_backoff()
