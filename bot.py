@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import asyncio
 import time
+import sys
 import os
 import logging
 from dotenv import load_dotenv
@@ -131,22 +132,67 @@ async def before_watchdog():
     await bot.wait_until_ready()
 
 
+BACKOFF_STATE_FILE = "/tmp/vc_bot_login_backoff.txt"
+LOGIN_TIMEOUT = 90  # seconds to allow a login attempt before treating it as hung and giving up
+
+
+def _get_last_backoff():
+    try:
+        with open(BACKOFF_STATE_FILE, "r") as f:
+            return int(f.read().strip())
+    except Exception:
+        return 0
+
+
+def _save_backoff(seconds):
+    try:
+        with open(BACKOFF_STATE_FILE, "w") as f:
+            f.write(str(seconds))
+    except Exception as e:
+        log.warning(f"Could not persist backoff state: {e}")
+
+
+def _clear_backoff():
+    try:
+        os.remove(BACKOFF_STATE_FILE)
+    except OSError:
+        pass
+
+
+async def _start_with_timeout():
+    log.info("Attempting to log in...")
+    try:
+        async with bot:
+            await asyncio.wait_for(bot.start(TOKEN), timeout=LOGIN_TIMEOUT)
+        log.info("bot.start() exited cleanly.")
+        _clear_backoff()
+    except asyncio.TimeoutError:
+        log.warning(f"Login attempt hung for over {LOGIN_TIMEOUT}s with no response, giving up on this attempt.")
+        raise
+
+
 def run_with_backoff():
-    """If bot.run() dies, don't let the process exit straight into Render's instant
-    auto-restart, that's what turns one temporary Discord rate-limit block into a
-    repeating one. Wait a real, growing amount of time before retrying instead."""
-    backoff = 60  # start at 1 minute
+    """bot.run() can hang forever without ever raising, even in a completely fresh process,
+    that's what happened here, so retrying in the same process (the old approach) isn't
+    enough on its own. Instead we drive the connection ourselves with bot.start() inside
+    asyncio.wait_for, which forces a hard ceiling on how long a single attempt is allowed
+    to hang before we give up on it. Either way (raised exception or forced timeout), we
+    sleep for a real, growing cooldown and then let the process actually exit, so Render
+    spins up a genuinely fresh one next time. The backoff duration is persisted to a small
+    local file so it keeps growing across restarts instead of resetting every time."""
     max_backoff = 3600  # cap at 1 hour
-    while True:
-        try:
-            bot.run(TOKEN)
-            log.info("bot.run() exited cleanly, stopping.")
-            break
-        except Exception as e:
-            log.warning(f"bot.run() crashed: {e}")
-        log.info(f"Waiting {backoff}s before trying to log in again...")
-        time.sleep(backoff)
-        backoff = min(backoff * 2, max_backoff)
+    try:
+        asyncio.run(_start_with_timeout())
+        return
+    except Exception as e:
+        log.warning(f"Login attempt failed: {e}")
+
+    prev = _get_last_backoff()
+    backoff = 60 if prev == 0 else min(prev * 2, max_backoff)
+    _save_backoff(backoff)
+    log.info(f"Sleeping {backoff}s before exiting, Render will restart with a fresh process after that.")
+    time.sleep(backoff)
+    sys.exit(1)
 
 
 keep_alive()
