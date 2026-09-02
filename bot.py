@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
 
+sys.stdout.reconfigure(line_buffering=True)
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
